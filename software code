@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator, Optional
+from .metrics import Metrics
+from .config import Config
+
+
+@dataclass(frozen=True)
+class PhysicalConfig:
+    bitrate: int  # bits per second
+    latency_ms: float  # propagation + processing latency
+    jitter_ms: float = 0.0
+    error_rate: float = 0.0  # probability of bit flip
+
+
+@dataclass
+class BitStream:
+    bits: list[int] = field(default_factory=list)
+
+    def append_bits(self, bits: Iterable[int]) -> None:
+        for b in bits:
+            if b not in (0, 1):
+                raise ValueError(f"Invalid bit: {b}")
+            self.bits.append(b)
+
+    def to_bytes(self) -> bytes:
+        if len(self.bits) % 8 != 0:
+            raise ValueError("BitStream length must be multiple of 8")
+        out = bytearray()
+        for i in range(0, len(self.bits), 8):
+            byte_bits = self.bits[i:i+8]
+            b = 0
+            for bit in byte_bits:
+                b = (b << 1) | bit
+            out.append(b)
+        return bytes(out)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> BitStream:
+        bits = []
+        for byte in data:
+            for i in reversed(range(8)):
+                bits.append((byte >> i) & 1)
+        return cls(bits=bits)
+
+
+class PhysicalLayer:
+    def __init__(
+        self,
+        config: PhysicalConfig,
+        metrics: Optional[Metrics] = None,
+        global_config: Optional[Config] = None,
+    ) -> None:
+        self._config = config
+        self._metrics = metrics or Metrics(layer_name="Physical")
+        self._global_config = global_config or Config()
+
+    def send_bits(self, bits: Iterable[int]) -> int:
+        start = time.perf_counter()
+        bit_list = list(bits)
+        if not bit_list:
+            return 0
+
+        num_bits = len(bit_list)
+        duration_sec = num_bits / self._config.bitrate
+
+        # Simulate latency + jitter
+        jitter = (self._config.jitter_ms / 1000.0) * (hash(tuple(bit_list[:8])) % 100) / 100.0
+        time.sleep(duration_sec + (self._config.latency_ms / 1000.0) + jitter)
+
+        # Simulate bit errors
+        if self._config.error_rate > 0:
+            import random
+            bit_list = [
+                b ^ 1 if random.random() < self._config.error_rate else b
+                for b in bit_list
+            ]
+
+        end = time.perf_counter()
+        self._metrics.record_operation(num_bytes=num_bits // 8, start=start, end=end)
+        return num_bits
+
+    def receive_bits(self, num_bits: int) -> list[int]:
+        start = time.perf_counter()
+        time.sleep(self._config.latency_ms / 1000.0)
+        end = time.perf_counter()
+        self._metrics.record_operation(num_bytes=num_bits // 8, start=start, end=end)
+        # Placeholder: return zeros; real impl would read from medium
+        return [0] * num_bits
+
+    @property
+    def config(self) -> PhysicalConfig:
+        return self._config
+
+    @property
+    def metrics(self) -> Metrics:
+        return self._metrics
