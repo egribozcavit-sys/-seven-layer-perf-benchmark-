@@ -96,4 +96,822 @@ class PhysicalLayer:
 
     @property
     def metrics(self) -> Metrics:
+        return self._
+# network_stack/layer1_physical/physical_layer.py
+"""Physical Layer (Layer 1) implementation for OSI network stack."""
+
+from __future__ import annotations
+
+import time
+import random
+import logging
+from typing import Iterable, Sequence, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+
+from .config import PhysicalConfig
+from .bitstream import BitStream
+from ..common.metrics import Metrics
+from ..common.config import Config
+
+
+logger = logging.getLogger(__name__)
+
+
+class TransmissionResult(Enum):
+    """Result status of a bit transmission operation."""
+    
+    SUCCESS = auto()
+    """All bits transmitted successfully."""
+    
+    PARTIAL = auto()
+    """Some bits transmitted with errors."""
+    
+    FAILED = auto()
+    """Transmission failed completely."""
+    
+    TIMEOUT = auto()
+    """Transmission timed out."""
+
+
+@dataclass(frozen=True)
+class TransmissionStats:
+    """
+    Statistics for a transmission operation.
+    
+    Attributes:
+        bits_sent: Number of bits attempted to transmit.
+        bits_received: Number of bits successfully received.
+        errors_detected: Number of bit errors detected.
+        duration_ms: Total transmission duration in milliseconds.
+        result: Transmission result status.
+        timestamp: Unix timestamp when transmission occurred.
+    """
+    
+    bits_sent: int
+    bits_received: int
+    errors_detected: int
+    duration_ms: float
+    result: TransmissionResult
+    timestamp: float = field(default_factory=time.time)
+    
+    @property
+    def error_rate(self) -> float:
+        """Calculate actual bit error rate for this transmission."""
+        if self.bits_sent == 0:
+            return 0.0
+        return self.errors_detected / self.bits_sent
+    
+    @property
+    def throughput_bps(self) -> float:
+        """Calculate effective throughput in bits per second."""
+        if self.duration_ms == 0:
+            return 0.0
+        return (self.bits_received / self.duration_ms) * 1000.0
+    
+    @property
+    def efficiency(self) -> float:
+        """Calculate transmission efficiency (0.0 to 1.0)."""
+        if self.bits_sent == 0:
+            return 1.0
+        return (self.bits_sent - self.errors_detected) / self.bits_sent
+
+
+class PhysicalLayer:
+    """
+    Physical layer (Layer 1) implementation for network simulation.
+    
+    This class simulates bit-level transmission over a physical medium
+    with configurable characteristics including bitrate, latency, jitter,
+    and bit error rate (BER).
+    
+    Features:
+        - Configurable transmission parameters
+        - Realistic latency and jitter simulation
+        - Bit error injection based on BER
+        - Comprehensive metrics collection
+        - Deterministic simulation with seed support
+    
+    Thread Safety: This class is NOT thread-safe. Use external synchronization
+    (e.g., threading.Lock) for concurrent access.
+    
+    Example:
+        >>> from network_stack.layer1_physical import PhysicalLayer, PhysicalConfig
+        >>> config = PhysicalConfig(
+        ...     bitrate=1_000_000,
+        ...     latency_ms=5.0,
+        ...     jitter_ms=1.0,
+        ...     error_rate=0.001
+        ... )
+        >>> layer = PhysicalLayer(config)
+        >>> bits = [1, 0, 1, 1, 0, 0, 1, 0]
+        >>> stats = layer.send_bits(bits)
+        >>> print(f"Sent {stats.bits_sent} bits with {stats.errors_detected} errors")
+    """
+    
+    def __init__(
+        self,
+        config: PhysicalConfig,
+        metrics: Optional[Metrics] = None,
+        global_config: Optional[Config] = None,
+        rng_seed: Optional[int] = None,
+        name: str = "PhysicalLayer",
+    ) -> None:
+        """
+        Initialize the PhysicalLayer.
+        
+        Args:
+            config: Physical layer configuration parameters.
+            metrics: Optional metrics collector for monitoring.
+            global_config: Optional global configuration override.
+            rng_seed
+# network_stack/layer1_physical/bitstream.py
+"""BitStream implementation for binary data handling."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator, Sequence, TypeVar, Generic
+from typing import Optional, Union
+import struct
+
+
+T = TypeVar('T')
+
+
+@dataclass
+class BitStream:
+    """
+    A mutable container for binary data represented as a sequence of bits.
+    
+    This class provides efficient storage and manipulation of binary data
+    at the bit level. It supports appending individual bits or sequences,
+    conversion to/from bytes, and various bit-level operations.
+    
+    Thread Safety: This class is NOT thread-safe. Use external synchronization
+    for concurrent access or use BitStreamView for read-only operations.
+    
+    Memory Efficiency: Bits are stored as integers (0 or 1) in a list. For
+    very large streams (>1MB), consider using bytearray-based implementation.
+    
+    Example:
+        >>> stream = BitStream()
+        >>> stream.append_bits([1, 0, 1, 1, 0, 0, 1, 0])
+        >>> stream.to_bytes()
+        b'\\xb0'
+        >>> stream.bit_length
+        8
+    """
+    
+    bits: list[int] = field(default_factory=list)
+    """Internal storage for bits."""
+    
+    def __post_init__(self) -> None:
+        """Validate initial bits if provided."""
+        if self.bits:
+            self._validate_bits(self.bits)
+    
+    @staticmethod
+    def _validate_bits(bits: Iterable[int]) -> None:
+        """
+        Validate that all bits are 0 or 1.
+        
+        Args:
+            bits: Iterable of bit values to validate.
+        
+        Raises:
+            ValueError: If any bit is not 0 or 1.
+        """
+        for b in bits:
+            if b not in (0, 1):
+                raise ValueError(
+                    f"Invalid bit value: {b}. Expected 0 or 1."
+                )
+    
+    def append_bits(self, bits: Iterable[int]) -> int:
+        """
+        Append multiple bits to the stream.
+        
+        This method validates each bit before appending. Invalid bits
+        will cause the entire operation to fail (atomic operation).
+        
+        Args:
+            bits: Iterable of integers (must be 0 or 1).
+        
+        Returns:
+            int: Number of bits appended.
+        
+        Raises:
+            ValueError: If any bit is not 0 or 1.
+        
+        Example:
+            >>> stream = BitStream()
+            >>> stream.append_bits([1, 0, 1, 0])
+            4
+        """
+        bit_list = list(bits)
+        self._validate_bits(bit_list)
+        self.bits.extend(bit_list)
+        return len(bit_list)
+    
+    def append_bit(self, bit: int) -> None:
+        """
+        Append a single bit to the stream.
+        
+        Args:
+            bit: Bit value (0 or 1).
+        
+        Raises:
+            ValueError: If bit is not 0 or 1.
+        """
+        if bit not in (0, 1):
+            raise ValueError(f"Invalid bit value: {bit}. Expected 0 or 1.")
+        self.bits.append(bit)
+    
+    def to_bytes(self, byteorder: str = 'big') -> bytes:
+        """
+        Convert the bit stream to bytes.
+        
+        Args:
+            byteorder: Byte order for conversion ('big' or 'little').
+        
+        Returns:
+            bytes: The binary data as a bytes object.
+        
+        Raises:
+            ValueError: If the number of bits is not a multiple of 8.
+        
+        Example:
+            >>> stream = BitStream(bits=[1, 0, 1, 0, 1, 0, 1, 0])
+            >>> stream.to_bytes()
+            b'\\xaa'
+        """
+        if len(self.bits) % 8 != 0:
+            raise ValueError(
+                f"BitStream length must be multiple of 8 to convert to bytes, "
+                f"got {len(self.bits)} bits"
+            )
+        
+        out = bytearray()
+        for i in range(0, len(self.bits), 8):
+            byte_bits = self.bits[i:i+8]
+            if byteorder == 'big':
+                b = 0
+                for bit in byte_bits:
+                    b = (b << 1) | bit
+            else:  # little endian
+                b = 0
+                for i, bit in enumerate(byte_bits):
+                    b |= (bit << i)
+            out.append(b)
+        
+        return bytes(out)
+    
+    @classmethod
+    def from_bytes(
+        cls, 
+        data: Union[bytes, bytearray, memoryview],
+        byteorder: str = 'big'
+    ) -> BitStream:
+        """
+        Create a BitStream from bytes.
+        
+        Args:
+            data: The binary data to convert.
+            byteorder: Byte order for conversion ('big' or 'little').
+        
+        Returns:
+            BitStream: A new instance with bits extracted from the bytes.
+        
+        Example:
+            >>> stream = BitStream.from_bytes(b'\\xaa')
+            >>> stream.bits
+            [1, 0, 1, 0, 1, 0, 1, 0]
+        """
+        bits = []
+        for byte in data:
+            if byteorder == 'big':
+                for i in reversed(range(8)):
+                    bits.append((byte >> i) & 1)
+            else:  # little endian
+                for i in range(8):
+                    bits.append((byte >> i) & 1)
+        
+        return cls(bits=bits)
+    
+    @classmethod
+    def from_int(
+        cls, 
+        value: int, 
+        bit_length: Optional[int] = None
+    ) -> BitStream:
+        """
+        Create a BitStream from an integer.
+        
+        Args:
+            value: Integer value to convert.
+            bit_length: Number of bits to use (default: minimum required).
+        
+        Returns:
+            BitStream: A new instance representing the integer.
+        
+        Raises:
+            ValueError: If value is negative or bit_length is insufficient.
+        
+        Example:
+            >>> stream = BitStream.from_int(42, bit_length=8)
+            >>> stream.bits
+            [0, 0, 1, 0, 1, 0, 1, 0]
+        """
+        if value < 0:
+            raise ValueError(f"Value must be non-negative, got {value}")
+        
+        if bit_length is None:
+            bit_length = max(1, value.bit_length())
+        elif value >= (1 << bit_length):
+            raise ValueError(
+                f"Value {value} requires more than {bit_length} bits"
+            )
+        
+        bits = []
+        for i in reversed(range(bit_length)):
+            bits.append((value >> i) & 1)
+        
+        return cls(bits=bits)
+    
+    def to_int(self) -> int:
+        """
+        Convert the bit stream to an integer.
+        
+        Returns:
+            int: The integer representation of the bits.
+        
+        Example:
+            >>> stream = BitStream(bits=[0, 0, 1, 0, 1, 0, 1, 0])
+            >>> stream.to_int()
+            42
+        """
+        value = 0
+        for bit in self.bits:
+            value = (value << 1) | bit
+        return value
+    
+    @property
+    def bit_length(self) -> int:
+        """Return the number of bits in the stream."""
+        return len(self.bits)
+    
+    @property
+    def byte_length(self) -> int:
+        """Return the number of complete bytes in the stream."""
+        return len(self.bits) // 8
+    
+    def __len__(self) -> int:
+        """Return the number of bits in the stream."""
+        return len(self.bits)
+    
+    def __iter__(self) -> Iterator[int]:
+        """Iterate over bits in the stream."""
+        return iter(self.bits)
+    
+    def __getitem__(self, index: Union[int, slice]) -> Union[int, list[int]]:
+        """
+        Get bit(s) at index or slice.
+        
+        Args:
+            index: Integer index or slice object.
+        
+        Returns:
+            Single bit (int) or list of bits for slice.
+        """
+        return self.bits[index]
+    
+    def __repr__(self) -> str:
+        """Return string representation of the BitStream."""
+        return f"BitStream(bits={self.bits!r})"
+    
+    def __eq__(self, other: object) -> bool:
+        """Check equality with another BitStream."""
+        if not isinstance(other, BitStream):
+            return NotImplemented
+        return self.bits == other.bits
+    
+    def clear(self) -> None:
+        """Remove all bits from the stream."""
+        self.bits.clear()
+    
+    def copy(self) -> BitStream:
+        """Create a shallow copy of the BitStream."""
+        return BitStream(bits=self.bits.copy())
+# network_stack/layer1_physical/physical_layer.py
+"""Physical Layer (Layer 1) implementation for OSI network stack."""
+
+from __future__ import annotations
+
+import time
+import random
+import logging
+from typing import Iterable, Sequence, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum, auto
+
+from .config import PhysicalConfig
+from .bitstream import BitStream
+from ..common.metrics import Metrics
+from ..common.config import Config
+
+
+logger = logging.getLogger(__name__)
+
+
+class TransmissionResult(Enum):
+    """Result status of a bit transmission operation."""
+    
+    SUCCESS = auto()
+    """All bits transmitted successfully."""
+    
+    PARTIAL = auto()
+    """Some bits transmitted with errors."""
+    
+    FAILED = auto()
+    """Transmission failed completely."""
+    
+    TIMEOUT = auto()
+    """Transmission timed out."""
+
+
+@dataclass(frozen=True)
+class TransmissionStats:
+    """
+    Statistics for a transmission operation.
+    
+    Attributes:
+        bits_sent: Number of bits attempted to transmit.
+        bits_received: Number of bits successfully received.
+        errors_detected: Number of bit errors detected.
+        duration_ms: Total transmission duration in milliseconds.
+        result: Transmission result status.
+        timestamp: Unix timestamp when transmission occurred.
+    """
+    
+    bits_sent: int
+    bits_received: int
+    errors_detected: int
+    duration_ms: float
+    result: TransmissionResult
+    timestamp: float = field(default_factory=time.time)
+    
+    @property
+    def error_rate(self) -> float:
+        """Calculate actual bit error rate for this transmission."""
+        if self.bits_sent == 0:
+            return 0.0
+        return self.errors_detected / self.bits_sent
+    
+    @property
+    def throughput_bps(self) -> float:
+        """Calculate effective throughput in bits per second."""
+        if self.duration_ms == 0:
+            return 0.0
+        return (self.bits_received / self.duration_ms) * 1000.0
+    
+    @property
+    def efficiency(self) -> float:
+        """Calculate transmission efficiency (0.0 to 1.0)."""
+        if self.bits_sent == 0:
+            return 1.0
+        return (self.bits_sent - self.errors_detected) / self.bits_sent
+
+
+class PhysicalLayer:
+    """
+    Physical layer (Layer 1) implementation for network simulation.
+    
+    This class simulates bit-level transmission over a physical medium
+    with configurable characteristics including bitrate, latency, jitter,
+    and bit error rate (BER).
+    
+    Features:
+        - Configurable transmission parameters
+        - Realistic latency and jitter simulation
+        - Bit error injection based on BER
+        - Comprehensive metrics collection
+        - Deterministic simulation with seed support
+    
+    Thread Safety: This class is NOT thread-safe. Use external synchronization
+    (e.g., threading.Lock) for concurrent access.
+    
+    Example:
+        >>> from network_stack.layer1_physical import PhysicalLayer, PhysicalConfig
+        >>> config = PhysicalConfig(
+        ...     bitrate=1_000_000,
+        ...     latency_ms=5.0,
+        ...     jitter_ms=1.0,
+        ...     error_rate=0.001
+        ... )
+        >>> layer = PhysicalLayer(config)
+        >>> bits = [1, 0, 1, 1, 0, 0, 1, 0]
+        >>> stats = layer.send_bits(bits)
+        >>> print(f"Sent {stats.bits_sent} bits with {stats.errors_detected} errors")
+    """
+    
+    def __init__(
+        self,
+        config: PhysicalConfig,
+        metrics: Optional[Metrics] = None,
+        global_config: Optional[Config] = None,
+        rng_seed: Optional[int] = None,
+        name: str = "PhysicalLayer",
+    ) -> None:
+        """
+        Initialize the PhysicalLayer.
+        
+        Args:
+            config: Physical layer configuration parameters.
+            metrics: Optional metrics collector for monitoring.
+            global_config: Optional global configuration override.
+            rng_seed: Random seed for reproducible error simulation.
+            name: Layer instance name for logging and identification.
+        
+        Raises:
+            ValueError: If configuration parameters are invalid.
+        """
+        self._config = config
+        self._metrics = metrics or Metrics(layer_name=name)
+        self._global_config = global_config or Config()
+        self._rng = random.Random(rng_seed)
+        self._name = name
+        
+        logger.info(
+            f"{self._name} initialized with bitrate={config.bitrate} bps, "
+            f"latency={config.latency_ms}ms, error_rate={config.error_rate}"
+        )
+    
+    def send_bits(
+        self, 
+        bits: Iterable[int],
+        timeout_ms: Optional[float] = None
+    ) -> TransmissionStats:
+        """
+        Transmit bits through the physical medium.
+        
+        This method simulates:
+        1. Transmission time based on configured bitrate
+        2. Propagation latency and random jitter
+        3. Bit errors based on configured bit error rate (BER)
+        
+        Args:
+            bits: Iterable of bits (0 or 1) to transmit.
+            timeout_ms: Optional timeout in milliseconds.
+        
+        Returns:
+            TransmissionStats: Statistics about the transmission.
+        
+        Raises:
+            ValueError: If any bit is not 0 or 1.
+            TimeoutError: If transmission exceeds timeout_ms.
+        
+        Example:
+            >>> layer = PhysicalLayer(PhysicalConfig(bitrate=1_000_000, latency_ms=5.0))
+            >>> stats = layer.send_bits([1, 0, 1, 1, 0, 0, 1, 0])
+            >>> assert stats.result == TransmissionResult.SUCCESS
+        """
+        start = time.perf_counter()
+        bit_list = list(bits)
+        
+        # Validate input
+        if not bit_list:
+            logger.debug(f"{self._name}: Empty transmission, returning immediately")
+            return TransmissionStats(
+                bits_sent=0,
+                bits_received=0,
+                errors_detected=0,
+                duration_ms=0.0,
+                result=TransmissionResult.SUCCESS
+            )
+        
+        # Validate bits
+        invalid_bits = {b for b in bit_list if b not in (0, 1)}
+        if invalid_bits:
+            raise ValueError(
+                f"Invalid bit values detected: {invalid_bits}. "
+                f"Expected only 0 or 1."
+            )
+        
+        num_bits = len(bit_list)
+        duration_sec = num_bits / self._config.bitrate
+        
+        # Simulate latency + jitter
+        jitter = self._calculate_jitter(bit_list)
+        total_delay = duration_sec + (self._config.latency_ms / 1000.0) + jitter
+        
+        # Check timeout
+        if timeout_ms is not None:
+            expected_duration_ms = total_delay * 1000
+            if expected_duration_ms > timeout_ms:
+                raise TimeoutError(
+                    f"Transmission would exceed timeout: "
+                    f"{expected_duration_ms:.2f}ms > {timeout_ms}ms"
+                )
+        
+        time.sleep(total_delay)
+        
+        # Simulate bit errors
+        errors_detected = 0
+        if self._config.error_rate > 0:
+            transmitted_bits, errors_detected = self._apply_bit_errors(bit_list)
+        else:
+            transmitted_bits = bit_list
+        
+        end = time.perf_counter()
+        duration_ms = (end - start) * 1000
+        
+        # Determine result
+        if errors_detected == 0:
+            result = TransmissionResult.SUCCESS
+        elif errors_detected < num_bits:
+            result = TransmissionResult.PARTIAL
+        else:
+            result = TransmissionResult.FAILED
+        
+        self._metrics.record_operation(
+            num_bytes=num_bits // 8,
+            start=start,
+            end=end,
+            layer="Physical"
+        )
+        
+        logger.debug(
+            f"{self._name}: Transmitted {num_bits} bits in {duration_ms:.2f}ms "
+            f"with {errors_detected} errors ({result.name})"
+        )
+        
+        return TransmissionStats(
+            bits_sent=num_bits,
+            bits_received=num_bits - errors_detected,
+            errors_detected=errors_detected,
+            duration_ms=duration_ms,
+            result=result
+        )
+    
+    def receive_bits(
+        self, 
+        num_bits: int,
+        timeout_ms: Optional[float] = None
+    ) -> Sequence[int]:
+        """
+        Receive bits from the physical medium.
+        
+        Note: This is a placeholder implementation. In a real system,
+        this would read from the actual transmission medium.
+        
+        Args:
+            num_bits: Number of bits to receive.
+            timeout_ms: Optional timeout in milliseconds.
+        
+        Returns:
+            Sequence[int]: Received bits (zeros in this simulation).
+        
+        Raises:
+            ValueError: If num_bits is negative.
+            TimeoutError: If reception exceeds timeout_ms.
+        """
+        if num_bits < 0:
+            raise ValueError(
+                f"num_bits must be non-negative, got {num_bits}"
+            )
+        
+        start = time.perf_counter()
+        
+        # Simulate latency
+        delay = self._config.latency_ms / 1000.0
+        
+        if timeout_ms is not None and (delay * 1000) > timeout_ms:
+            raise TimeoutError(
+                f"Reception would exceed timeout: {delay * 1000:.2f}ms > {timeout_ms}ms"
+            )
+        
+        time.sleep(delay)
+        
+        end = time.perf_counter()
+        duration_ms = (end - start) * 1000
+        
+        self._metrics.record_operation(
+            num_bytes=num_bits // 8,
+            start=start,
+            end=end,
+            layer="Physical"
+        )
+        
+        logger.debug(
+            f"{self._name}: Received {num_bits} bits in {duration_ms:.2f}ms"
+        )
+        
+        # Placeholder: return zeros
+        # TODO: Implement actual medium reading
+        return [0] * num_bits
+    
+    def send_bitstream(
+        self, 
+        stream: BitStream,
+        timeout_ms: Optional[float] = None
+    ) -> TransmissionStats:
+        """
+        Transmit a BitStream through the physical medium.
+        
+        Convenience method that wraps send_bits for BitStream objects.
+        
+        Args:
+            stream: BitStream to transmit.
+            timeout_ms: Optional timeout in milliseconds.
+        
+        Returns:
+            TransmissionStats: Statistics about the transmission.
+        """
+        return self.send_bits(stream.bits, timeout_ms=timeout_ms)
+    
+    def receive_bitstream(
+        self, 
+        num_bits: int,
+        timeout_ms: Optional[float] = None
+    ) -> BitStream:
+        """
+        Receive bits into a BitStream.
+        
+        Args:
+            num_bits: Number of bits to receive.
+            timeout_ms: Optional timeout in milliseconds.
+        
+        Returns:
+            BitStream: Received bits as a BitStream.
+        """
+        bits = self.receive_bits(num_bits, timeout_ms=timeout_ms)
+        return BitStream(bits=list(bits))
+    
+    def _calculate_jitter(self, bits: Sequence[int]) -> float:
+        """
+        Calculate jitter based on bit pattern and configuration.
+        
+        Args:
+            bits: Sequence of bits to analyze.
+        
+        Returns:
+            float: Jitter value in seconds.
+        """
+        if self._config.jitter_ms == 0:
+            return 0.0
+        
+        # Use first 8 bits for deterministic jitter calculation
+        sample = bits[:8] if len(bits) >= 8 else bits + [0] * (8 - len(bits))
+        pattern_hash = hash(tuple(sample)) % 100
+        jitter_factor = pattern_hash / 100.0
+        return (self._config.jitter_ms / 1000.0) * jitter_factor
+    
+    def _apply_bit_errors(
+        self, 
+        bits: Sequence[int]
+    ) -> Tuple[list[int], int]:
+        """
+        Apply random bit errors based on configured error rate.
+        
+        Args:
+            bits: Original bit sequence.
+        
+        Returns:
+            Tuple of (corrupted_bits, error_count).
+        """
+        errors = 0
+        corrupted = []
+        
+        for bit in bits:
+            if self._rng.random() < self._config.error_rate:
+                corrupted.append(bit ^ 1)
+                errors += 1
+            else:
+                corrupted.append(bit)
+        
+        return corrupted, errors
+    
+    @property
+    def config(self) -> PhysicalConfig:
+        """Return the current physical layer configuration."""
+        return self._config
+    
+    @property
+    def metrics(self) -> Metrics:
+        """Return the metrics collector instance."""
         return self._metrics
+    
+    @property
+    def name(self) -> str:
+        """Return the layer instance name."""
+        return self._name
+    
+    def __repr__(self) -> str:
+        """Return string representation of the PhysicalLayer."""
+        return (
+            f"PhysicalLayer("
+            f"name={self._name!r}, "
+            f"bitrate={self._config.bitrate}, "
+            f"latency_ms={self._config.latency_ms})"
+        )
