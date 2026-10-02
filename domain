@@ -56,3 +56,728 @@ class Payment:
             "updated_at": self.updated_at.isoformat(),
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }
+from dataclasses import dataclass
+from decimal import Decimal
+
+
+@dataclass(frozen=True)
+class Money:
+    amount: Decimal
+    currency: str
+
+    def __post_init__(self):
+        if self.amount < 0:
+            raise ValueError("Amount cannot be negative")
+        if not self.currency or len(self.currency) != 3:
+            raise ValueError("Invalid currency code")
+
+    def __add__(self, other: "Money") -> "Money":
+        if self.currency != other.currency:
+            raise ValueError("Cannot add different currencies")
+        return Money(self.amount + other.amount, self.currency)
+
+    def to_float(self) -> float:
+        return float(self.amount)
+from dataclasses import dataclass
+from datetime import datetime
+
+
+@dataclass
+class PaymentCreatedEvent:
+    payment_id: str
+    transaction_id: str
+    amount: float
+    currency: str
+    customer_id: str | None
+    timestamp: datetime
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.utcnow()
+from typing import Protocol, Optional
+from src.domain.entities.payment import Payment
+
+
+class PaymentRepositoryProtocol(Protocol):
+    async def create(self, payment: Payment) -> Payment:
+        ...
+
+    async def get_by_id(self, payment_id: str) -> Optional[Payment]:
+        ...
+
+    async def get_by_idempotency_key(self, key: str) -> Optional[Payment]:
+        ...
+
+    async def update(self, payment: Payment) -> Payment:
+        ...
+
+    async def delete(self, payment_id: str) -> bool:
+        ...
+from dataclasses import dataclass
+from typing import Optional
+from src.domain.entities.payment import Payment
+from src.domain.repositories.payment_repository import PaymentRepositoryProtocol
+from src.domain.events.payment_created import PaymentCreatedEvent
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CreatePaymentCommand:
+    amount: float
+    currency: str
+    idempotency_key: Optional[str] = None
+    customer_id: Optional[str] = None
+    description: Optional[str] = None
+    metadata: Optional[dict] = None
+
+
+class CreatePaymentHandler:
+    def __init__(self, repository: PaymentRepositoryProtocol):
+        self.repository = repository
+
+    async def execute(self, command: CreatePaymentCommand) -> Payment:
+        if command.idempotency_key:
+            existing = await self.repository.get_by_idempotency_key(command.idempotency_key)
+            if existing:
+                logger.info(f"Idempotent payment found: {existing.id}")
+                return existing
+
+        payment = Payment(
+            amount=command.amount,
+            currency=command.currency,
+            idempotency_key=command.idempotency_key,
+            customer_id=command.customer_id,
+            description=command.description,
+            metadata=command.metadata or {},
+        )
+
+        payment.mark_as_processing()
+        created = await self.repository.create(payment)
+
+        event = PaymentCreatedEvent(
+            payment_id=created.id,
+            transaction_id=created.transaction_id,
+            amount=created.amount,
+            currency=created.currency,
+            customer_id=created.customer_id,
+            timestamp=created.created_at,
+        )
+        logger.info(f"Payment created event: {event}")
+
+        return created
+from dataclasses import dataclass
+from typing import Optional
+from src.domain.entities.payment import Payment
+from src.domain.repositories.payment_repository import PaymentRepositoryProtocol
+
+
+@dataclass
+class GetPaymentQuery:
+    payment_id: str
+
+
+class GetPaymentHandler:
+    def __init__(self, repository: PaymentRepositoryProtocol):
+        self.repository = repository
+
+    async def execute(self, query: GetPaymentQuery) -> Optional[Payment]:
+        return await self.repository.get_by_id(query.payment_id)
+from dataclasses import dataclass
+from typing import Optional
+from datetime import datetime
+
+
+@dataclass
+class PaymentDTO:
+    id: str
+    transaction_id: str
+    amount: float
+    currency: str
+    status: str
+    idempotency_key: Optional[str]
+    customer_id: Optional[str]
+    description: Optional[str]
+    metadata: dict
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime]
+
+    @classmethod
+    def from_entity(cls, payment) -> "PaymentDTO":
+        return cls(
+            id=payment.id,
+            transaction_id=payment.transaction_id,
+            amount=payment.amount,
+            currency=payment.currency,
+            status=payment.status.value,
+            idempotency_key=payment.idempotency_key,
+            customer_id=payment.customer_id,
+            description=payment.description,
+            metadata=payment.metadata,
+            created_at=payment.created_at,
+            updated_at=payment.updated_at,
+            completed_at=payment.completed_at,
+        )from dataclasses import dataclass
+from typing import Optional, List
+
+
+@dataclass
+class ValidationError:
+    field: str
+    message: str
+
+
+class PaymentValidator:
+    VALID_CURRENCIES = {"USD", "EUR", "TRY", "GBP"}
+    MAX_AMOUNT = 1_000_000.0
+    MIN_AMOUNT = 0.01
+
+    @classmethod
+    def validate_amount(cls, amount: float) -> List[ValidationError]:
+        errors = []
+        if amount < cls.MIN_AMOUNT:
+            errors.append(ValidationError("amount", f"Amount must be at least {cls.MIN_AMOUNT}"))
+        if amount > cls.MAX_AMOUNT:
+            errors.append(ValidationError("amount", f"Amount cannot exceed {cls.MAX_AMOUNT}"))
+        return errors
+
+    @classmethod
+    def validate_currency(cls, currency: str) -> List[ValidationError]:
+        errors = []
+        if not currency or currency.upper() not in cls.VALID_CURRENCIES:
+            errors.append(ValidationError("currency", f"Currency must be one of {cls.VALID_CURRENCIES}"))
+        return errors
+
+    @classmethod
+    def validate_idempotency_key(cls, key: Optional[str]) -> List[ValidationError]:
+        errors = []
+        if key and len(key) > 100:
+            errors.append(ValidationError("idempotency_key", "Idempotency key must be less than 100 characters"))
+        return errors
+
+    @classmethod
+    def validate_all(cls, amount: float, currency: str, idempotency_key: Optional[str] = None) -> List[ValidationError]:
+        errors = []
+        errors.extend(cls.validate_amount(amount))
+        errors.extend(cls.validate_currency(currency))
+        errors.extend(cls.validate_idempotency_key(idempotency_key))
+        return errors
+import redis.asyncio as redis
+import json
+import logging
+from typing import Optional, Any
+
+logger = logging.getLogger(__name__)
+
+
+class RedisService:
+    def __init__(self, redis_url: str):
+        self.redis_url = redis_url
+        self._redis: Optional[redis.Redis] = None
+
+    async def connect(self) -> None:
+        self._redis = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
+        await self._redis.ping()
+        logger.info("Redis connected successfully")
+
+    async def disconnect(self) -> None:
+        if self._redis:
+            await self._redis.close()
+            logger.info("Redis disconnected")
+
+    async def set(self, key: str, value: Any, expiration: Optional[int] = None) -> bool:
+        try:
+            serialized = json.dumps(value)
+            if expiration:
+                await self._redis.setex(key, expiration, serialized)
+            else:
+                await self._redis.set(key, serialized)
+            return True
+        except Exception as e:
+            logger.error(f"Redis SET error: {e}")
+            return False
+
+    async def get(self, key: str) -> Optional[Any]:
+        try:
+            value = await self._redis.get(key)
+            return json.loads(value) if value else None
+        except Exception as e:
+            logger.error(f"Redis GET error: {e}")
+            return None
+
+    async def delete(self, key: str) -> bool:
+        try:
+            await self._redis.delete(key)
+            return True
+        except Exception as e:
+            logger.error(f"Redis DELETE error: {e}")
+            return False
+
+    async def publish(self, channel: str, message: dict) -> int:
+        try:
+            serialized = json.dumps(message)
+            return await self._redis.publish(channel, serialized)
+        except Exception as e:
+            logger.error(f"Redis PUBLISH error: {e}")
+            return 0
+
+    async def xadd(self, stream: str, data: dict) -> str:
+        try:
+            return await self._redis.xadd(stream, data)
+        except Exception as e:
+            logger.error(f"Redis XADD error: {e}")
+            raise Exception(f"Redis stream error: {e}")
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import jwt, JWTError
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class JWTService:
+    def __init__(self, secret_key: str, algorithm: str = "HS256", expiration_minutes: int = 60):
+        self.secret_key = secret_key
+        self.algorithm = algorithm
+        self.expiration_minutes = expiration_minutes
+
+    def create_access_token(self, data: dict, expires_delta: Optional[timedelta] = None) -> str:
+        to_encode = data.copy()
+        expire = datetime.utcnow() + (expires_delta or timedelta(minutes=self.expiration_minutes))
+        to_encode.update({"exp": expire})
+        
+        try:
+            encoded_jwt = jwt.encode(to_encode, self.secret_key, algorithm=self.algorithm)
+            logger.info(f"Access token created for: {data.get('sub')}")
+            return encoded_jwt
+        except Exception as e:
+            logger.error(f"JWT encode error: {e}")
+            raise Exception("Failed to create access token")
+
+    def decode_access_token(self, token: str) -> dict:
+        try:
+            payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
+            logger.info(f"Access token decoded for: {payload.get('sub')}")
+            return payload
+        except JWTError as e:
+            logger.error(f"JWT decode error: {e}")
+            raise Exception("Invalid or expired token")
+
+    def verify_token(self, token: str) -> bool:
+        try:
+            self.decode_access_token(token)
+            return True
+        except Exception:
+            return False
+import structlog
+import logging
+
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    context_class=dict,
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+logger = structlog.get_logger()
+
+
+class AuditLogger:
+    @staticmethod
+    def log_payment_created(payment_id: str, transaction_id: str, amount: float, currency: str, customer_id: Optional[str] = None) -> None:
+        logger.info("payment_created", payment_id=payment_id, transaction_id=transaction_id, amount=amount, currency=currency, customer_id=customer_id, event_type="audit")
+
+    @staticmethod
+    def log_payment_completed(payment_id: str, transaction_id: str, amount: float, currency: str) -> None:
+        logger.info("payment_completed", payment_id=payment_id, transaction_id=transaction_id, amount=amount, currency=currency, event_type="audit")
+
+    @staticmethod
+    def log_payment_failed(payment_id: str, transaction_id: str, reason: str) -> None:
+        logger.warning("payment_failed", payment_id=payment_id, transaction_id=transaction_id, reason=reason, event_type="audit")
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+import logging
+
+logger = logging.getLogger(__name__)
+Base = declarative_base()
+
+
+class Database:
+    def __init__(self, database_url: str):
+        self.database_url = database_url
+        self.engine = create_async_engine(database_url, echo=False, pool_pre_ping=True, pool_size=10, max_overflow=20)
+        self.async_session_maker = async_sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def create_tables(self) -> None:
+        logger.info("Creating database tables...")
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Database tables created successfully")
+
+    async def get_session(self) -> AsyncSession:
+        async with self.async_session_maker() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+
+    async def close(self) -> None:
+        await self.engine.dispose()
+        logger.info("Database connection closed")
+from sqlalchemy import Column, String, Float, DateTime, Enum as SQLEnum, Text
+from sqlalchemy.dialects.postgresql import JSONB
+from datetime import datetime
+import enum
+from src.persistence.database import Base
+
+
+class PaymentStatusEnum(enum.Enum):
+    pending = "pending"
+    processing = "processing"
+    completed = "completed"
+    failed = "failed"
+    refunded = "refunded"
+
+
+class PaymentModel(Base):
+    __tablename__ = "payments"
+
+    id = Column(String(36), primary_key=True, index=True)
+    transaction_id = Column(String(36), unique=True, index=True, nullable=False)
+    amount = Column(Float, nullable=False)
+    currency = Column(String(3), nullable=False, default="USD")
+    status = Column(SQLEnum(PaymentStatusEnum), nullable=False, default=PaymentStatusEnum.pending)
+    idempotency_key = Column(String(100), unique=True, index=True, nullable=True)
+    customer_id = Column(String(36), index=True, nullable=True)
+    description = Column(Text, nullable=True)
+    metadata = Column(JSONB, nullable=True, default=dict)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<Payment(id={self.id}, amount={self.amount}, status={self.status})>"
+from typing import Optional
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.domain.entities.payment import Payment, PaymentStatus
+from src.domain.repositories.payment_repository import PaymentRepositoryProtocol
+from src.persistence.models.payment_model import PaymentModel, PaymentStatusEnum
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class PaymentRepositoryImpl(PaymentRepositoryProtocol):
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def create(self, payment: Payment) -> Payment:
+        payment_model = PaymentModel(
+            id=payment.id,
+            transaction_id=payment.transaction_id,
+            amount=payment.amount,
+            currency=payment.currency,
+            status=PaymentStatusEnum(payment.status.value),
+            idempotency_key=payment.idempotency_key,
+            customer_id=payment.customer_id,
+            description=payment.description,
+            metadata=payment.metadata,
+            created_at=payment.created_at,
+            updated_at=payment.updated_at,
+            completed_at=payment.completed_at,
+        )
+        self.session.add(payment_model)
+        await self.session.commit()
+        await self.session.refresh(payment_model)
+        logger.info(f"Payment created in database: {payment.id}")
+        return payment
+
+    async def get_by_id(self, payment_id: str) -> Optional[Payment]:
+        result = await self.session.execute(select(PaymentModel).where(PaymentModel.id == payment_id))
+        payment_model = result.scalar_one_or_none()
+        if not payment_model:
+            return None
+        return self._to_entity(payment_model)
+
+    async def get_by_idempotency_key(self, key: str) -> Optional[Payment]:
+        result = await self.session.execute(select(PaymentModel).where(PaymentModel.idempotency_key == key))
+        payment_model = result.scalar_one_or_none()
+        if not payment_model:
+            return None
+        return self._to_entity(payment_model)
+
+    async def update(self, payment: Payment) -> Payment:
+        result = await self.session.execute(select(PaymentModel).where(PaymentModel.id == payment.id))
+        payment_model = result.scalar_one_or_none()
+        if not payment_model:
+            raise ValueError(f"Payment not found: {payment.id}")
+        payment_model.status = PaymentStatusEnum(payment.status.value)
+        payment_model.amount = payment.amount
+        payment_model.currency = payment.currency
+        payment_model.updated_at = payment.updated_at
+        payment_model.completed_at = payment.completed_at
+        await self.session.commit()
+        await self.session.refresh(payment_model)
+        logger.info(f"Payment updated in database: {payment.id}")
+        return payment
+
+    async def delete(self, payment_id: str) -> bool:
+        result = await self.session.execute(select(PaymentModel).where(PaymentModel.id == payment_id))
+        payment_model = result.scalar_one_or_none()
+        if not payment_model:
+            return False
+        await self.session.delete(payment_model)
+        await self.session.commit()
+        logger.info(f"Payment deleted from database: {payment_id}")
+        return True
+
+    def _to_entity(self, model: PaymentModel) -> Payment:
+        return Payment(
+            id=model.id,
+            transaction_id=model.transaction_id,
+            amount=model.amount,
+            currency=model.currency,
+            status=PaymentStatus(model.status.value),
+            idempotency_key=model.idempotency_key,
+            customer_id=model.customer_id,
+            description=model.description,
+            metadata=model.metadata or {},
+            created_at=model.created_at,
+            updated_at=model.updated_at,
+            completed_at=model.completed_at,
+        )
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from src.persistence.repositories.payment_repository_impl import PaymentRepositoryImpl
+from src.application.commands.create_payment import CreatePaymentCommand, CreatePaymentHandler
+from src.application.queries.get_payment import GetPaymentQuery, GetPaymentHandler
+from src.application.dto.payment_dto import PaymentDTO
+from src.application.validators.payment_validator import PaymentValidator
+from src.api.schemas.payment_schemas import PaymentCreateRequest, PaymentResponse
+from src.infrastructure.logging.audit_logger import AuditLogger
+import logging
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+def get_repository(request: Request) -> PaymentRepositoryImpl:
+    from src.persistence.database import Database
+    db: Database = request.app.state.db
+    session_generator = db.get_session()
+    session = next(session_generator)
+    return PaymentRepositoryImpl(session)
+
+
+@router.post("/", response_model=PaymentResponse, status_code=status.HTTP_201_CREATED)
+async def create_payment(request: PaymentCreateRequest, repository: PaymentRepositoryImpl = Depends(get_repository)):
+    errors = PaymentValidator.validate_all(amount=request.amount, currency=request.currency, idempotency_key=request.idempotency_key)
+    if errors:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=[{"field": e.field, "message": e.message} for e in errors])
+    
+    command = CreatePaymentCommand(amount=request.amount, currency=request.currency, idempotency_key=request.idempotency_key, customer_id=request.customer_id, description=request.description, metadata=request.metadata)
+    handler = CreatePaymentHandler(repository)
+    payment = await handler.execute(command)
+    
+    AuditLogger.log_payment_created(payment_id=payment.id, transaction_id=payment.transaction_id, amount=payment.amount, currency=payment.currency, customer_id=payment.customer_id)
+    logger.info(f"Payment created: {payment.id}")
+    return PaymentDTO.from_entity(payment)
+
+
+@router.get("/{payment_id}", response_model=PaymentResponse)
+async def get_payment(payment_id: str, repository: PaymentRepositoryImpl = Depends(get_repository)):
+    query = GetPaymentQuery(payment_id=payment_id)
+    handler = GetPaymentHandler(repository)
+    payment = await handler.execute(query)
+    if not payment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found")
+    logger.info(f"Payment retrieved: {payment.id}")
+    return PaymentDTO.from_entity(payment)
+from fastapi import Request, status
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+from src.infrastructure.services.jwt_service import JWTService
+from src.shared.constants import Config
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in ["/health", "/", "/docs", "/openapi.json"]:
+            return await call_next(request)
+        
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"detail": "Missing or invalid authorization header"})
+        
+        token = auth_header.split(" ")[1]
+        jwt_service = JWTService(secret_key=Config.JWT_SECRET_KEY, algorithm=Config.JWT_ALGORITHM, expiration_minutes=Config.JWT_EXPIRATION_MINUTES)
+        
+        if not jwt_service.verify_token(token):
+            return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"detail": "Invalid or expired token"})
+        
+        try:
+            payload = jwt_service.decode_access_token(token)
+            request.state.user_id = payload.get("sub")
+            request.state.user_email = payload.get("email")
+        except Exception:
+            return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"detail": "Token validation failed"})
+        
+        return await call_next(request)
+from fastapi import Request, status
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+import logging
+import traceback
+
+logger = logging.getLogger(__name__)
+
+
+class ErrorHandlerMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as e:
+            logger.error(f"Unhandled error: {e}")
+            logger.error(traceback.format_exc())
+            return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal server error", "type": type(e).__name__})
+from fastapi import Request, status
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+from collections import defaultdict
+from datetime import datetime, timedelta
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class RateLimiterMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, requests_per_minute: int = 60):
+        super().__init__(app)
+        self.requests_per_minute = requests_per_minute
+        self.requests = defaultdict(list)
+
+    async def dispatch(self, request: Request, call_next):
+        client_ip = request.client.host
+        now = datetime.utcnow()
+        minute_ago = now - timedelta(minutes=1)
+        
+        self.requests[client_ip] = [
+            req_time for req_time in self.requests[client_ip]
+            if req_time > minute_ago
+        ]
+        
+        if len(self.requests[client_ip]) >= self.requests_per_minute:
+            logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+            return JSONResponse(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                content={"detail": "Too many requests. Please try again later."}
+            )
+        
+        self.requests[client_ip].append(now)
+        return await call_next(request)
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+from datetime import datetime
+
+
+class PaymentCreateRequest(BaseModel):
+    amount: float = Field(..., gt=0, le=1_000_000, description="Payment amount")
+    currency: str = Field(..., min_length=3, max_length=3, description="Currency code")
+    idempotency_key: Optional[str] = Field(None, max_length=100, description="Idempotency key")
+    customer_id: Optional[str] = Field(None, description="Customer ID")
+    description: Optional[str] = Field(None, max_length=500, description="Payment description")
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional metadata")
+
+
+class PaymentResponse(BaseModel):
+    id: str
+    transaction_id: str
+    amount: float
+    currency: str
+    status: str
+    idempotency_key: Optional[str]
+    customer_id: Optional[str]
+    description: Optional[str]
+    metadata: Dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse
+
+router = APIRouter()
+
+
+@router.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>PayCore Dashboard</title>
+    </head>
+    <body>
+        <h1>PayCore Enterprise Dashboard</h1>
+        <p>Payment management system</p>
+    </body>
+    </html>
+    """
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Config:
+    APP_NAME = os.getenv("APP_NAME", "PayCore Enterprise")
+    APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
+    DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://paycore:paycore123@localhost:5432/paycore")
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-in-production")
+    JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+    JWT_EXPIRATION_MINUTES = int(os.getenv("JWT_EXPIRATION_MINUTES", "60"))
+class PayCoreException(Exception):
+    pass
+
+class InfrastructureError(PayCoreException):
+    pass
+
+class AuthenticationError(PayCoreException):
+    pass
+
+class ValidationError(PayCoreException):
+    pass
+import uuid
+from datetime import datetime
+from typing import Optional
+
+
+def generate_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def generate_idempotency_key() -> str:
+    return f"idem_{generate_uuid()}_{int(datetime.utcnow().timestamp())}"
+
+
+def sanitize_string(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return value.strip()[:500]
+
