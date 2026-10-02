@@ -1,0 +1,58 @@
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+import uuid
+
+
+class PaymentStatus(Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    REFUNDED = "refunded"
+
+
+@dataclass
+class Payment:
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    transaction_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    amount: float = 0.0
+    currency: str = "USD"
+    status: PaymentStatus = PaymentStatus.PENDING
+    idempotency_key: Optional[str] = None
+    customer_id: Optional[str] = None
+    description: Optional[str] = None
+    metadata: dict = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    completed_at: Optional[datetime] = None
+
+    def mark_as_completed(self) -> None:
+        self.status = PaymentStatus.COMPLETED
+        self.completed_at = datetime.utcnow()
+        self.updated_at = datetime.utcnow()
+
+    def mark_as_failed(self) -> None:
+        self.status = PaymentStatus.FAILED
+        self.updated_at = datetime.utcnow()
+
+    def mark_as_processing(self) -> None:
+        self.status = PaymentStatus.PROCESSING
+        self.updated_at = datetime.utcnow()
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "transaction_id": self.transaction_id,
+            "amount": self.amount,
+            "currency": self.currency,
+            "status": self.status.value,
+            "idempotency_key": self.idempotency_key,
+            "customer_id": self.customer_id,
+            "description": self.description,
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
